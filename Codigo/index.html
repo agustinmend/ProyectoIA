@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>IA Seguridad</title>
+    <style>
+        body { background: #111; color: white; font-family: Arial, sans-serif; padding: 20px; }
+        #status-bar {
+            margin-top: 10px;
+            padding: 10px;
+            font-size: 18px;
+            background: #222;
+            border-radius: 8px;
+        }
+        #label-container { font-size: 26px; font-weight: bold; margin-top: 10px; }
+        #progress-bar-container {
+            width: 400px;
+            height: 20px;
+            background: #333;
+            border-radius: 10px;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+        #progress-bar {
+            height: 100%;
+            width: 0%;
+            background: #f90;
+            border-radius: 10px;
+            transition: width 0.1s;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background: #2196F3;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        button:hover { background: #1976D2; }
+    </style>
+</head>
+<body>
+    <button type="button" onclick="init()">Iniciar Camara</button>
+
+    <div style="margin-top: 20px;">
+        <canvas id="canvas"></canvas>
+    </div>
+    <canvas id="canvas_clean" style="display:none;"></canvas>
+
+    <div id="label-container">Esperando modelo...</div>
+
+    <!-- Barra de progreso de confirmación -->
+    <div id="progress-bar-container">
+        <div id="progress-bar"></div>
+    </div>
+
+    <div id="status-bar">Estado: <span id="estado-texto">Inactivo</span></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/pose@0.8/dist/teachablemachine-pose.min.js"></script>
+    <script>
+        const URL = "./modelo/";
+
+        // ==========================================
+        // AJUSTA ESTOS VALORES SI SIGUE SIN DETECTAR
+        // ==========================================
+        const UMBRAL_CONFIANZA = 0.80;   // Bajamos de 0.95 a 0.80
+        const FRAMES_REQUERIDOS = 10;    // Bajamos de 15 a 10 (~0.33 seg)
+        const COOLDOWN_MS = 10000;       // 10 segundos entre alertas
+        // ==========================================
+
+        let model, webcam, ctx, ctx_clean, labelContainer, maxPredictions;
+        let bloqueoEnvio = false;
+        let framesConfirmacion = 0;
+
+        async function init() {
+            document.getElementById("estado-texto").innerText = "Cargando modelo...";
+            const modelURL = URL + "model.json";
+            const metadataURL = URL + "metadata.json";
+
+            model = await tmPose.load(modelURL, metadataURL);
+            maxPredictions = model.getTotalClasses();
+            console.log("[INFO] Modelo cargado. Clases:", maxPredictions);
+
+            const size = 400;
+            webcam = new tmPose.Webcam(size, size, true);
+            await webcam.setup();
+            await webcam.play();
+            window.requestAnimationFrame(loop);
+
+            const canvas = document.getElementById("canvas");
+            canvas.width = size; canvas.height = size;
+            ctx = canvas.getContext("2d");
+
+            const canvas_clean = document.getElementById("canvas_clean");
+            canvas_clean.width = size; canvas_clean.height = size;
+            ctx_clean = canvas_clean.getContext("2d");
+
+            labelContainer = document.getElementById("label-container");
+            document.getElementById("estado-texto").innerText = "Modelo activo";
+        }
+
+        async function loop(timestamp) {
+            webcam.update();
+            ctx.drawImage(webcam.canvas, 0, 0);
+            ctx_clean.drawImage(webcam.canvas, 0, 0);
+            await predict();
+            window.requestAnimationFrame(loop);
+        }
+
+        async function predict() {
+            const canvas_clean = document.getElementById("canvas_clean");
+            const { pose, posenetOutput } = await model.estimatePose(canvas_clean);
+            if (!pose) return;
+            const prediction = await model.predict(posenetOutput);
+
+            // Encontrar la clase con mayor probabilidad
+            let maxProb = 0;
+            let claseDetectada = "";
+            for (let i = 0; i < maxPredictions; i++) {
+                if (prediction[i].probability > maxProb) {
+                    maxProb = prediction[i].probability;
+                    claseDetectada = prediction[i].className;
+                }
+            }
+
+            // Mostrar todas las clases en consola para depurar
+            // (Comenta esta línea si llena mucho la consola)
+            console.log(`[PRED] ${claseDetectada}: ${(maxProb * 100).toFixed(1)}%`);
+
+            // Actualizar label en pantalla
+            labelContainer.innerHTML = `${claseDetectada}: ${(maxProb * 100).toFixed(1)}%`;
+
+            // ==========================================
+            // LÓGICA DE PERSISTENCIA CON BARRA DE PROGRESO
+            // ==========================================
+            const esTrepando = claseDetectada.toLowerCase() === "trepando" && maxProb >= UMBRAL_CONFIANZA;
+
+            if (esTrepando) {
+                framesConfirmacion++;
+                labelContainer.style.color = "orange";
+            } else {
+                framesConfirmacion = 0;
+                labelContainer.style.color = "white";
+            }
+
+            // Actualizar barra de progreso
+            const porcentaje = Math.min((framesConfirmacion / FRAMES_REQUERIDOS) * 100, 100);
+            document.getElementById("progress-bar").style.width = porcentaje + "%";
+
+            if (framesConfirmacion >= FRAMES_REQUERIDOS && !bloqueoEnvio) {
+                document.getElementById("estado-texto").innerText = "ALERTA ENVIADA";
+                document.getElementById("progress-bar").style.background = "red";
+                enviarAlerta();
+                framesConfirmacion = 0;
+            }
+            // ==========================================
+
+            drawPose(pose);
+        }
+
+        function enviarAlerta() {
+            bloqueoEnvio = true;
+            labelContainer.style.color = "red";
+            console.log("[ALERTA] Condición confirmada. Enviando a Flask...");
+
+            const canvas_clean = document.getElementById("canvas_clean");
+            const dataURL = canvas_clean.toDataURL("image/jpeg", 0.8);
+
+            fetch("http://localhost:5000/alerta", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ imagen: dataURL })
+            })
+            .then(res => res.json())
+            .then(data => console.log("[FLASK] Respuesta:", data))
+            .catch(error => console.error("[ERROR] No se pudo conectar a Flask:", error));
+
+            setTimeout(() => {
+                bloqueoEnvio = false;
+                labelContainer.style.color = "white";
+                document.getElementById("progress-bar").style.background = "#f90";
+                document.getElementById("estado-texto").innerText = "Modelo activo";
+                console.log("[INFO] Cooldown terminado. Sistema listo.");
+            }, COOLDOWN_MS);
+        }
+
+        function drawPose(pose) {
+            if (pose) {
+                const minPartConfidence = 0.5;
+                tmPose.drawKeypoints(pose.keypoints, minPartConfidence, ctx);
+                tmPose.drawSkeleton(pose.keypoints, minPartConfidence, ctx);
+            }
+        }
+    </script>
+</body>
+</html>
